@@ -1,0 +1,10 @@
+[package]
+name = "multi-monitor-tray-dimmer"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight Windows tray utility to dim and control brightness per monitor via tray menu or global hotkeys."
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
