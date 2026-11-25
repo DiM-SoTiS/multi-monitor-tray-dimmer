@@ -21,6 +21,7 @@ const WM_PAINT: u32 = 0x000F;
 const WM_COMMAND: u32 = 0x0111;
 const WM_TIMER: u32 = 0x0113;
 const WM_HOTKEY: u32 = 0x0312;
+const WM_LBUTTONUP: u32 = 0x0202;
 const WM_RBUTTONUP: u32 = 0x0205;
 const WM_LBUTTONDBLCLK: u32 = 0x0203;
 
@@ -212,6 +213,15 @@ extern "system" {
         cy: i32,
         u_flags: u32,
     ) -> i32;
+    fn SetProcessDpiAwarenessContext(value: isize) -> i32;
+    fn SetProcessDPIAware() -> i32;
+}
+
+unsafe fn enable_per_monitor_dpi_awareness() {
+    // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+    if SetProcessDpiAwarenessContext(-4) == 0 {
+        let _ = SetProcessDPIAware();
+    }
 }
 
 #[link(name = "gdi32")]
@@ -254,35 +264,80 @@ fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Generates a 32x32 sun/brightness tray icon in memory.
+/// Generates a crisp 4x-supersampled 32x32 Cosmic Glass HUD dimmer icon (half-lit sun/eclipse in cyan + amber).
 unsafe fn create_tray_icon() -> Hicon {
     let w = 32usize;
     let h = 32usize;
     let mut pixels = vec![0u32; w * h];
 
+    let blend = |bg: (f32, f32, f32, f32), fg: (f32, f32, f32, f32)| -> (f32, f32, f32, f32) {
+        let a = fg.3 + bg.3 * (1.0 - fg.3);
+        if a <= 0.0001 {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+        let r = (fg.0 * fg.3 + bg.0 * bg.3 * (1.0 - fg.3)) / a;
+        let g = (fg.1 * fg.3 + bg.1 * bg.3 * (1.0 - fg.3)) / a;
+        let b = (fg.2 * fg.3 + bg.2 * bg.3 * (1.0 - fg.3)) / a;
+        (r, g, b, a)
+    };
+
     for y in 0..h {
         for x in 0..w {
-            let dx = (x as isize - 15).abs();
-            let dy = (y as isize - 15).abs();
-            let in_rounded = dx < 14 && dy < 14 && (dx + dy) < 25;
-            if !in_rounded {
-                pixels[y * w + x] = 0x00000000;
-                continue;
-            }
-            let is_border = dx == 13 || dy == 13 || (dx + dy) == 24;
-            let dist_sq = (x as isize - 16).pow(2) + (y as isize - 16).pow(2);
-            let is_sun_core = dist_sq <= 20;
-            let is_sun_ring = (40..=58).contains(&dist_sq);
+            let mut acc = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let px = x as f32 + (sx as f32 + 0.5) * 0.25 - 16.0;
+                    let py = y as f32 + (sy as f32 + 0.5) * 0.25 - 16.0;
+                    let ax = px.abs();
+                    let ay = py.abs();
 
-            pixels[y * w + x] = if is_border {
-                0xFF_F0_B9_48 // amber border
-            } else if is_sun_core {
-                0xFF_F0_B9_48 // amber sun
-            } else if is_sun_ring {
-                0xFF_38_BD_F8 // cyan outer glow
-            } else {
-                0xFF_12_17_23 // dark HUD background
-            };
+                    // Chamfered Cosmic Glass HUD badge
+                    let in_badge = ax <= 14.5 && ay <= 14.5 && (ax + ay) <= 25.0;
+                    if !in_badge {
+                        continue;
+                    }
+                    let mut col = (7.0, 10.0, 18.0, 1.0); // #070A12 deep space fill
+
+                    // Crisp 1.4px cyan outer hairline border
+                    let on_border = ax >= 13.1 || ay >= 13.1 || (ax + ay) >= 23.6;
+                    if on_border {
+                        col = blend(col, (0.0, 240.0, 255.0, 0.95)); // #00F0FF
+                    } else {
+                        let r = (px * px + py * py).sqrt();
+                        // Outer cyan dimmer ring
+                        if (r - 8.6).abs() <= 1.05 {
+                            col = blend(col, (0.0, 240.0, 255.0, 0.92));
+                        }
+                        // Inner half-lit disc: left half warm amber (#FF9900), right half dimmed
+                        if r <= 6.2 {
+                            if px <= 0.0 {
+                                col = blend(col, (255.0, 153.0, 0.0, 1.0)); // #FF9900 amber
+                            } else {
+                                col = blend(col, (22.0, 34.0, 56.0, 0.95));
+                            }
+                        }
+                        // 4 crisp cardinal tick marks (scientific HUD reticle)
+                        let cardinal = (ax <= 0.85 && (10.5..=12.4).contains(&ay))
+                            || (ay <= 0.85 && (10.5..=12.4).contains(&ax));
+                        if cardinal {
+                            col = blend(col, (255.0, 153.0, 0.0, 0.92));
+                        }
+                    }
+
+                    acc.0 += col.0 * col.3;
+                    acc.1 += col.1 * col.3;
+                    acc.2 += col.2 * col.3;
+                    acc.3 += col.3;
+                }
+            }
+            let a = (acc.3 / 16.0).clamp(0.0, 1.0);
+            if a > 0.001 {
+                let r = (acc.0 / acc.3).clamp(0.0, 255.0) as u32;
+                let g = (acc.1 / acc.3).clamp(0.0, 255.0) as u32;
+                let b = (acc.2 / acc.3).clamp(0.0, 255.0) as u32;
+                let au = (a * 255.0) as u32;
+                pixels[y * w + x] = (au << 24) | (r << 16) | (g << 8) | b;
+            }
         }
     }
 
@@ -471,7 +526,7 @@ extern "system" fn main_wnd_proc(hwnd: Hwnd, msg: u32, w_param: usize, l_param: 
         match msg {
             WM_APP_TRAY => {
                 let mouse_msg = (l_param & 0xFFFF) as u32;
-                if mouse_msg == WM_RBUTTONUP {
+                if mouse_msg == WM_LBUTTONUP || mouse_msg == WM_RBUTTONUP {
                     if let Some(state) = get_state_mut(hwnd) {
                         show_context_menu(hwnd, state);
                     }
@@ -641,6 +696,7 @@ extern "system" fn toast_wnd_proc(hwnd: Hwnd, msg: u32, w_param: usize, l_param:
 
 pub fn run_app() {
     unsafe {
+        enable_per_monitor_dpi_awareness();
         let h_inst = GetModuleHandleW(null());
         let main_class = to_wide("MultiMonitorTrayDimmerMain");
         let overlay_class = to_wide("MultiMonitorTrayDimmerOverlay");
