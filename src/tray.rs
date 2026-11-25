@@ -264,7 +264,9 @@ fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Generates a crisp 4x-supersampled 32x32 Cosmic Glass HUD dimmer icon (half-lit sun/eclipse in cyan + amber).
+/// Generates the Telemetry Sigil Tray Version (32x32, 4x supersampled, transparent background):
+/// Overlapping dual monitors — rear monitor in Electric Cyan (#00F0FF), front monitor in Amber (#FF9900)
+/// with rising brightness bars inside and a clean monitor stand.
 unsafe fn create_tray_icon() -> Hicon {
     let w = 32usize;
     let h = 32usize;
@@ -281,47 +283,65 @@ unsafe fn create_tray_icon() -> Hicon {
         (r, g, b, a)
     };
 
+    // Signed distance to a rounded box centered at (cx, cy) with half-extents (hx, hy) and corner radius rad
+    let sd_rbox = |px: f32, py: f32, cx: f32, cy: f32, hx: f32, hy: f32, rad: f32| -> f32 {
+        let qx = (px - cx).abs() - (hx - rad);
+        let qy = (py - cy).abs() - (hy - rad);
+        let ox = qx.max(0.0);
+        let oy = qy.max(0.0);
+        (ox * ox + oy * oy).sqrt() + qx.max(qy).min(0.0) - rad
+    };
+
     for y in 0..h {
         for x in 0..w {
             let mut acc = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
             for sy in 0..4 {
                 for sx in 0..4 {
-                    let px = x as f32 + (sx as f32 + 0.5) * 0.25 - 16.0;
-                    let py = y as f32 + (sy as f32 + 0.5) * 0.25 - 16.0;
-                    let ax = px.abs();
-                    let ay = py.abs();
+                    let px = x as f32 + (sx as f32 + 0.5) * 0.25;
+                    let py = y as f32 + (sy as f32 + 0.5) * 0.25;
+                    let mut col = (0.0f32, 0.0f32, 0.0f32, 0.0f32); // 100% transparent tray background
 
-                    // Chamfered Cosmic Glass HUD badge
-                    let in_badge = ax <= 14.5 && ay <= 14.5 && (ax + ay) <= 25.0;
-                    if !in_badge {
-                        continue;
+                    // 1. Rear monitor (Electric Cyan #00F0FF) — top-right: x in [11..30], y in [4..19]
+                    let d_rear = sd_rbox(px, py, 20.5, 11.5, 9.5, 7.2, 2.2);
+                    if d_rear <= 0.0 && d_rear >= -2.5 {
+                        col = blend(col, (0.0, 240.0, 255.0, 1.0));
                     }
-                    let mut col = (7.0, 10.0, 18.0, 1.0); // #070A12 deep space fill
+                    // Rear monitor small foot indicator
+                    if (20.5..=24.0).contains(&px) && (19.6..=22.0).contains(&py) {
+                        col = blend(col, (0.0, 240.0, 255.0, 1.0));
+                    }
 
-                    // Crisp 1.4px cyan outer hairline border
-                    let on_border = ax >= 13.1 || ay >= 13.1 || (ax + ay) >= 23.6;
-                    if on_border {
-                        col = blend(col, (0.0, 240.0, 255.0, 0.95)); // #00F0FF
-                    } else {
-                        let r = (px * px + py * py).sqrt();
-                        // Outer cyan dimmer ring
-                        if (r - 8.6).abs() <= 1.05 {
-                            col = blend(col, (0.0, 240.0, 255.0, 0.92));
-                        }
-                        // Inner half-lit disc: left half warm amber (#FF9900), right half dimmed
-                        if r <= 6.2 {
-                            if px <= 0.0 {
-                                col = blend(col, (255.0, 153.0, 0.0, 1.0)); // #FF9900 amber
+                    // 2. Front monitor (Amber #FF9900) — bottom-left: x in [2..23], y in [10..25]
+                    let d_front = sd_rbox(px, py, 12.5, 17.5, 10.2, 7.2, 2.2);
+                    if d_front <= 0.0 {
+                        // Dark translucent interior so it cleanly occludes the rear cyan monitor
+                        col = (14.0, 14.0, 18.0, 0.94);
+
+                        // Rising stepped brightness bars inside front screen
+                        if (5.0..=20.0).contains(&px) && (13.0..=22.0).contains(&py) {
+                            let t = (px - 5.0) / 15.0; // 0.0 .. 1.0
+                            let bar_top = 22.0 - t * 8.2;
+                            if py >= bar_top {
+                                // Stepped vertical brightness gradient (brighter on left/bottom, amber glow)
+                                let step = ((px - 5.0) / 3.75).floor();
+                                let intensity = 0.45 + (3.0 - step).clamp(0.0, 3.0) * 0.18;
+                                col = blend(col, (255.0, 153.0, 0.0, intensity));
                             } else {
-                                col = blend(col, (22.0, 34.0, 56.0, 0.95));
+                                col = blend(col, (255.0, 153.0, 0.0, 0.14));
                             }
                         }
-                        // 4 crisp cardinal tick marks (scientific HUD reticle)
-                        let cardinal = (ax <= 0.85 && (10.5..=12.4).contains(&ay))
-                            || (ay <= 0.85 && (10.5..=12.4).contains(&ax));
-                        if cardinal {
-                            col = blend(col, (255.0, 153.0, 0.0, 0.92));
+
+                        // Bold amber frame stroke
+                        if d_front >= -2.5 {
+                            col = (255.0, 153.0, 0.0, 1.0);
                         }
+                    }
+
+                    // Front monitor neck & base stand in Amber
+                    if ((10.6..=14.4).contains(&px) && (24.5..=27.2).contains(&py))
+                        || ((7.2..=17.8).contains(&px) && (26.6..=29.2).contains(&py))
+                    {
+                        col = (255.0, 153.0, 0.0, 1.0);
                     }
 
                     acc.0 += col.0 * col.3;
