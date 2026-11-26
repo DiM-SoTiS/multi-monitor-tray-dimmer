@@ -5,11 +5,20 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::i18n::Lang;
+
 pub const MIN_BRIGHTNESS: u8 = 20;
 pub const MAX_BRIGHTNESS: u8 = 100;
 pub const DEFAULT_BRIGHTNESS: u8 = 100;
 pub const NIGHT_BRIGHTNESS: u8 = 40;
 pub const BRIGHTNESS_STEP: i16 = 10;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AppConfig {
+    pub levels: BTreeMap<String, u8>,
+    pub lang: Option<Lang>,
+    pub sync_all: bool,
+}
 
 /// Clamps brightness percentage into `[20, 100]`.
 pub fn clamp_brightness(value: i16) -> u8 {
@@ -44,41 +53,51 @@ pub fn config_file_path() -> Option<PathBuf> {
         .map(|dir| PathBuf::from(dir).join("multi-monitor-tray-dimmer").join("config.ini"))
 }
 
-pub fn parse_config(raw: &str) -> BTreeMap<String, u8> {
-    let mut map = BTreeMap::new();
+pub fn parse_config(raw: &str) -> AppConfig {
+    let mut cfg = AppConfig::default();
     for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
         if let Some((key, val)) = trimmed.split_once('=') {
-            if let Ok(pct) = val.trim().parse::<i16>() {
-                map.insert(key.trim().to_string(), clamp_brightness(pct));
+            let k = key.trim();
+            let v = val.trim();
+            if k.eq_ignore_ascii_case("lang") {
+                cfg.lang = Lang::from_code(v);
+            } else if k.eq_ignore_ascii_case("sync") {
+                cfg.sync_all = matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+            } else if let Ok(pct) = v.parse::<i16>() {
+                cfg.levels.insert(k.to_string(), clamp_brightness(pct));
             }
         }
     }
-    map
+    cfg
 }
 
-pub fn serialize_config(levels: &BTreeMap<String, u8>) -> String {
+pub fn serialize_config(cfg: &AppConfig) -> String {
     let mut out = String::new();
-    for (k, v) in levels {
+    if let Some(lang) = cfg.lang {
+        out.push_str(&format!("lang={}\n", lang.as_code()));
+    }
+    out.push_str(&format!("sync={}\n", if cfg.sync_all { 1 } else { 0 }));
+    for (k, v) in &cfg.levels {
         out.push_str(&format!("{k}={}\n", clamp_brightness(*v as i16)));
     }
     out
 }
 
-pub fn load_config(path: &Path) -> BTreeMap<String, u8> {
+pub fn load_config(path: &Path) -> AppConfig {
     fs::read_to_string(path)
         .map(|s| parse_config(&s))
         .unwrap_or_default()
 }
 
-pub fn save_config(path: &Path, levels: &BTreeMap<String, u8>) {
+pub fn save_config(path: &Path, cfg: &AppConfig) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let _ = fs::write(path, serialize_config(levels));
+    let _ = fs::write(path, serialize_config(cfg));
 }
 
 #[cfg(test)]
@@ -109,13 +128,17 @@ mod tests {
     }
 
     #[test]
-    fn roundtrips_monitor_config() {
-        let mut map = BTreeMap::new();
-        map.insert("DISPLAY1".to_string(), 70);
-        map.insert("DISPLAY2".to_string(), 40);
-        let serialized = serialize_config(&map);
+    fn roundtrips_monitor_config_and_lang() {
+        let mut cfg = AppConfig::default();
+        cfg.lang = Some(Lang::En);
+        cfg.sync_all = true;
+        cfg.levels.insert("DISPLAY1".to_string(), 70);
+        cfg.levels.insert("DISPLAY2".to_string(), 40);
+        let serialized = serialize_config(&cfg);
         let parsed = parse_config(&serialized);
-        assert_eq!(parsed.get("DISPLAY1"), Some(&70));
-        assert_eq!(parsed.get("DISPLAY2"), Some(&40));
+        assert_eq!(parsed.lang, Some(Lang::En));
+        assert!(parsed.sync_all);
+        assert_eq!(parsed.levels.get("DISPLAY1"), Some(&70));
+        assert_eq!(parsed.levels.get("DISPLAY2"), Some(&40));
     }
 }

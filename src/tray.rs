@@ -1,47 +1,69 @@
-//! Native Win32 system tray icon, per-monitor submenus, global hotkeys, and dark toast popup.
+//! Native Win32 system tray icon, Cosmic Glass HUD flyout, global hotkeys, and dark toast popup.
 
 #![cfg(windows)]
 
-use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 
+use crate::autostart::{is_autostart_enabled, set_autostart_enabled};
 use crate::dimmer::{
-    config_file_path, load_config, save_config, step_brightness, toggle_night_mode,
+    config_file_path, load_config, save_config, step_brightness, toggle_night_mode, AppConfig,
     BRIGHTNESS_STEP, DEFAULT_BRIGHTNESS, MAX_BRIGHTNESS,
 };
+use crate::flyout::{
+    compute_flyout_height, hit_test_control, hit_test_slider, x_to_brightness, FlyoutControl,
+    FooterAction, FLYOUT_WIDTH,
+};
+use crate::flyout_ui::{open_external_url, paint_flyout, FlyoutViewModel, SliderCardItem};
+use crate::i18n::{
+    all_monitors_card_label, detect_system_lang, toast_all_monitors, toast_autostart,
+    toast_brightness_set, toast_day_on, toast_night_on, toast_refreshed_body,
+    toast_refreshed_title, toast_reset_title, toast_sync, tray_tooltip, Lang,
+};
+use crate::updater::{check_latest_release, download_and_spawn_replace, UpdateState};
 use crate::win32_monitors::{
-    active_monitor_handle, apply_monitor_brightness, create_overlay_window, destroy_overlay_windows,
-    enumerate_monitors, Hwnd, MonitorEntry, Rect,
+    active_monitor_handle, apply_overlay_only, create_overlay_window, destroy_overlay_windows,
+    enumerate_monitors, DdcWorker, Hwnd, MonitorEntry, Rect,
 };
 
+const DONATE_URL: &str = "https://yoomoney.ru/fundraise/1LP6PQKIMJN.261125";
+const GITHUB_REPO_URL: &str = "https://github.com/DiM-SoTiS/multi-monitor-tray-dimmer";
+
 const WM_APP_TRAY: u32 = 0x8000 + 1;
+const WM_APP_UPDATE_RESULT: u32 = 0x8000 + 2;
 const WM_DESTROY: u32 = 0x0002;
+const WM_ACTIVATE: u32 = 0x0006;
 const WM_PAINT: u32 = 0x000F;
-const WM_COMMAND: u32 = 0x0111;
+const WM_ERASEBKGND: u32 = 0x0014;
+const WM_KEYDOWN: u32 = 0x0100;
 const WM_TIMER: u32 = 0x0113;
-const WM_HOTKEY: u32 = 0x0312;
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
-const WM_RBUTTONUP: u32 = 0x0205;
 const WM_LBUTTONDBLCLK: u32 = 0x0203;
+const WM_RBUTTONUP: u32 = 0x0205;
+const WM_HOTKEY: u32 = 0x0312;
+
+const WA_INACTIVE: usize = 0;
+const VK_ESCAPE: usize = 0x1B;
 
 const HOTKEY_BRIGHT_UP: usize = 1;
 const HOTKEY_BRIGHT_DOWN: usize = 2;
 const HOTKEY_NIGHT_TOGGLE: usize = 3;
+const HOTKEY_SYNC_DOWN: usize = 4;
+const HOTKEY_SYNC_UP: usize = 5;
 const MOD_ALT: u32 = 0x0001;
 const MOD_CONTROL: u32 = 0x0002;
+const MOD_WIN: u32 = 0x0008;
 const MOD_NOREPEAT: u32 = 0x4000;
+const VK_LEFT: u32 = 0x25;
 const VK_UP: u32 = 0x26;
+const VK_RIGHT: u32 = 0x27;
 const VK_DOWN: u32 = 0x28;
 const VK_D: u32 = 0x44;
 
-const IDM_NIGHT_ALL: usize = 1001;
-const IDM_RESET_ALL: usize = 1002;
-const IDM_REFRESH_MONITORS: usize = 1003;
-const IDM_EXIT: usize = 1004;
-const IDM_MONITOR_BASE: usize = 2000; // 2000 + monitor_idx * 10 + preset_idx
-
-const PRESETS: [u8; 5] = [100, 80, 60, 40, 20];
 const TOAST_TIMER_ID: usize = 1;
 const TOAST_DURATION_MS: u32 = 2500;
 
@@ -55,19 +77,18 @@ const WS_POPUP: u32 = 0x80000000;
 const WS_EX_TOPMOST: u32 = 0x00000008;
 const WS_EX_TOOLWINDOW: u32 = 0x00000080;
 const WS_EX_NOACTIVATE: u32 = 0x08000000;
-const SW_SHOWNOACTIVATE: i32 = 4;
 const SW_HIDE: i32 = 0;
-
-const MF_STRING: u32 = 0x00000000;
-const MF_CHECKED: u32 = 0x00000008;
-const MF_SEPARATOR: u32 = 0x00000800;
-const MF_POPUP: u32 = 0x00000010;
-const TPM_RIGHTALIGN: u32 = 0x0008;
-const TPM_BOTTOMALIGN: u32 = 0x0020;
+const SW_SHOWNOACTIVATE: i32 = 4;
+const SW_SHOW: i32 = 5;
 
 const SPI_GETWORKAREA: u32 = 0x0030;
+const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+const DWMWA_BORDER_COLOR: u32 = 34;
+const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
 const DWMWCP_ROUND: u32 = 2;
+const DWMSBT_TRANSIENTWINDOW: u32 = 3;
+
 const DT_LEFT: u32 = 0x00000000;
 const DT_NOPREFIX: u32 = 0x00000800;
 const DT_END_ELLIPSIS: u32 = 0x00008000;
@@ -173,25 +194,16 @@ extern "system" {
     fn GetMessageW(lp_msg: *mut Msg, h_wnd: Hwnd, min: u32, max: u32) -> i32;
     fn TranslateMessage(lp_msg: *const Msg) -> i32;
     fn DispatchMessageW(lp_msg: *const Msg) -> isize;
+    fn PostMessageW(h_wnd: Hwnd, msg: u32, w_param: usize, l_param: isize) -> i32;
     fn PostQuitMessage(n_exit_code: i32);
     fn ShowWindow(h_wnd: Hwnd, n_cmd_show: i32) -> i32;
+    fn IsWindowVisible(h_wnd: Hwnd) -> i32;
     fn InvalidateRect(h_wnd: Hwnd, lp_rect: *const Rect, b_erase: i32) -> i32;
     fn SetTimer(h_wnd: Hwnd, id: usize, elapse: u32, func: *const c_void) -> usize;
     fn KillTimer(h_wnd: Hwnd, id: usize) -> i32;
-    fn CreatePopupMenu() -> Hmenu;
-    fn AppendMenuW(h_menu: Hmenu, u_flags: u32, u_id_new_item: usize, lp_new_item: *const u16) -> i32;
-    fn DestroyMenu(h_menu: Hmenu) -> i32;
-    fn TrackPopupMenu(
-        h_menu: Hmenu,
-        u_flags: u32,
-        x: i32,
-        y: i32,
-        n_reserved: i32,
-        h_wnd: Hwnd,
-        prc_rect: *const Rect,
-    ) -> i32;
-    fn GetCursorPos(lp_point: *mut Point) -> i32;
     fn SetForegroundWindow(h_wnd: Hwnd) -> i32;
+    fn SetCapture(h_wnd: Hwnd) -> Hwnd;
+    fn ReleaseCapture() -> i32;
     fn SystemParametersInfoW(ui_action: u32, ui_param: u32, pv_param: *mut c_void, f_win_ini: u32) -> i32;
     fn BeginPaint(h_wnd: Hwnd, lp_paint: *mut PaintStruct) -> Hdc;
     fn EndPaint(h_wnd: Hwnd, lp_paint: *const PaintStruct) -> i32;
@@ -379,56 +391,88 @@ unsafe fn create_tray_icon() -> Hicon {
 
 struct AppState {
     h_inst: Hinstance,
+    main_hwnd: Hwnd,
+    flyout_hwnd: Hwnd,
     overlay_class: Vec<u16>,
     monitors: Vec<MonitorEntry>,
-    levels: BTreeMap<String, u8>,
+    config: AppConfig,
+    lang: Lang,
+    autostart: bool,
+    about_open: bool,
+    ddc: DdcWorker,
+    dragging_monitor: Option<usize>,
+    update_state: UpdateState,
+    update_rx: Option<Receiver<UpdateState>>,
     toast_hwnd: Hwnd,
     toast_title: String,
     toast_body: String,
 }
 
 impl AppState {
+    fn save_cfg(&self) {
+        if let Some(cfg_path) = config_file_path() {
+            save_config(&cfg_path, &self.config);
+        }
+    }
+
     fn refresh_monitors(&mut self) {
         destroy_overlay_windows(&mut self.monitors);
         self.monitors = enumerate_monitors();
+        let ddc = &self.ddc;
         for m in &mut self.monitors {
             m.overlay_hwnd = create_overlay_window(self.h_inst, &self.overlay_class, m.rect);
-            let level = *self.levels.get(&m.id).unwrap_or(&DEFAULT_BRIGHTNESS);
-            self.levels.entry(m.id.clone()).or_insert(level);
-            apply_monitor_brightness(m, level);
+            let level = *self.config.levels.get(&m.id).unwrap_or(&DEFAULT_BRIGHTNESS);
+            self.config.levels.entry(m.id.clone()).or_insert(level);
+            apply_overlay_only(m, level);
+            ddc.send(m, level);
         }
     }
 
-    fn set_monitor_level(&mut self, idx: usize, level: u8, notify: bool) {
-        let label = if let Some(m) = self.monitors.get(idx) {
-            self.levels.insert(m.id.clone(), level);
-            apply_monitor_brightness(m, level);
-            if let Some(cfg_path) = config_file_path() {
-                save_config(&cfg_path, &self.levels);
+    fn set_monitor_level(&mut self, idx: usize, level: u8, notify: bool, send_ddc: bool) {
+        let lang = self.lang;
+        let label = if let Some(m) = self.monitors.get_mut(idx) {
+            self.config.levels.insert(m.id.clone(), level);
+            apply_overlay_only(m, level);
+            if send_ddc {
+                self.ddc.send(m, level);
             }
-            Some(m.label.clone())
+            Some(m.display_label(lang))
         } else {
             None
         };
+        if label.is_some() {
+            self.save_cfg();
+        }
         if notify {
             if let Some(lbl) = label {
-                self.show_toast(&lbl, &format!("Яркость установлена: {level}%"));
+                self.show_toast(&lbl, &toast_brightness_set(lang, level));
             }
         }
     }
 
-    fn set_all_levels(&mut self, level: u8, label: &str) {
-        for m in &self.monitors {
-            self.levels.insert(m.id.clone(), level);
-            apply_monitor_brightness(m, level);
+    fn set_all_levels(&mut self, level: u8, title: &str) {
+        self.set_all_levels_live(level, true, true);
+        self.show_toast(title, &toast_all_monitors(self.lang, level));
+    }
+
+    fn set_all_levels_live(&mut self, level: u8, send_ddc: bool, persist: bool) {
+        for m in &mut self.monitors {
+            self.config.levels.insert(m.id.clone(), level);
+            apply_overlay_only(m, level);
+            if send_ddc {
+                self.ddc.send(m, level);
+            }
         }
-        if let Some(cfg_path) = config_file_path() {
-            save_config(&cfg_path, &self.levels);
+        if persist {
+            self.save_cfg();
         }
-        self.show_toast(label, &format!("Все мониторы: {level}%"));
     }
 
     fn step_active_monitor(&mut self, delta: i16) {
+        if self.config.sync_all {
+            self.step_sync_or_primary(delta);
+            return;
+        }
         let active_h = active_monitor_handle();
         let idx = self
             .monitors
@@ -436,9 +480,88 @@ impl AppState {
             .position(|m| m.h_monitor == active_h)
             .unwrap_or(0);
         if let Some(m) = self.monitors.get(idx) {
-            let cur = *self.levels.get(&m.id).unwrap_or(&DEFAULT_BRIGHTNESS);
+            let cur = *self.config.levels.get(&m.id).unwrap_or(&DEFAULT_BRIGHTNESS);
             let next = step_brightness(cur, delta);
-            self.set_monitor_level(idx, next, true);
+            self.set_monitor_level(idx, next, true, true);
+        }
+    }
+
+    fn step_sync_or_primary(&mut self, delta: i16) {
+        let primary_idx = self
+            .monitors
+            .iter()
+            .position(|m| m.is_primary)
+            .unwrap_or(0);
+        let cur = self
+            .monitors
+            .get(primary_idx)
+            .and_then(|m| self.config.levels.get(&m.id).copied())
+            .unwrap_or(DEFAULT_BRIGHTNESS);
+        let next = step_brightness(cur, delta);
+        if self.config.sync_all {
+            let title = all_monitors_card_label(self.lang, self.monitors.len());
+            self.set_all_levels(next, &title);
+        } else {
+            self.set_monitor_level(primary_idx, next, true, true);
+        }
+        unsafe {
+            InvalidateRect(self.flyout_hwnd, null(), 0);
+        }
+    }
+
+    fn toggle_sync(&mut self) {
+        let next = !self.config.sync_all;
+        self.config.sync_all = next;
+        if next {
+            let primary_level = self
+                .monitors
+                .iter()
+                .find(|m| m.is_primary)
+                .or_else(|| self.monitors.first())
+                .and_then(|m| self.config.levels.get(&m.id).copied())
+                .unwrap_or(DEFAULT_BRIGHTNESS);
+            self.set_all_levels_live(primary_level, true, false);
+        }
+        self.save_cfg();
+        let (title, body) = toast_sync(self.lang, next);
+        self.show_toast(title, body);
+        unsafe {
+            reposition_flyout(self);
+        }
+    }
+
+    fn build_flyout_vm(&self) -> FlyoutViewModel<'_> {
+        let cards = if self.config.sync_all {
+            let level = self
+                .monitors
+                .iter()
+                .find(|m| m.is_primary)
+                .or_else(|| self.monitors.first())
+                .and_then(|m| self.config.levels.get(&m.id).copied())
+                .unwrap_or(DEFAULT_BRIGHTNESS);
+            vec![SliderCardItem {
+                label: all_monitors_card_label(self.lang, self.monitors.len()),
+                brightness: level,
+                accent_amber: true,
+            }]
+        } else {
+            self.monitors
+                .iter()
+                .map(|m| SliderCardItem {
+                    label: m.display_label(self.lang),
+                    brightness: *self.config.levels.get(&m.id).unwrap_or(&DEFAULT_BRIGHTNESS),
+                    accent_amber: m.is_primary,
+                })
+                .collect()
+        };
+        FlyoutViewModel {
+            lang: self.lang,
+            sync_all: self.config.sync_all,
+            autostart: self.autostart,
+            about_open: self.about_open,
+            monitor_count: self.monitors.len(),
+            cards,
+            update_state: &self.update_state,
         }
     }
 
@@ -446,15 +569,76 @@ impl AppState {
         let first = self
             .monitors
             .first()
-            .and_then(|m| self.levels.get(&m.id).copied())
+            .and_then(|m| self.config.levels.get(&m.id).copied())
             .unwrap_or(DEFAULT_BRIGHTNESS);
         let next = toggle_night_mode(first);
         let title = if next < MAX_BRIGHTNESS {
-            "Ночной режим включён"
+            toast_night_on(self.lang)
         } else {
-            "Дневной режим (100%)"
+            toast_day_on(self.lang)
         };
         self.set_all_levels(next, title);
+    }
+
+    fn toggle_lang(&mut self) {
+        let next = self.lang.toggle();
+        self.lang = next;
+        self.config.lang = Some(next);
+        self.save_cfg();
+        unsafe {
+            InvalidateRect(self.flyout_hwnd, null(), 0);
+        }
+    }
+
+    fn toggle_autostart(&mut self) {
+        let next = !self.autostart;
+        if set_autostart_enabled(next).is_ok() {
+            self.autostart = next;
+            let (title, body) = toast_autostart(self.lang, next);
+            self.show_toast(title, body);
+            unsafe {
+                InvalidateRect(self.flyout_hwnd, null(), 0);
+            }
+        }
+    }
+
+    fn trigger_update_action(&mut self) {
+        match &self.update_state {
+            UpdateState::Checking | UpdateState::Downloading => {}
+            UpdateState::Available { download_url, .. } => {
+                let url = download_url.clone();
+                self.update_state = UpdateState::Downloading;
+                unsafe {
+                    InvalidateRect(self.flyout_hwnd, null(), 0);
+                }
+                if download_and_spawn_replace(&url).is_ok() {
+                    unsafe {
+                        PostQuitMessage(0);
+                    }
+                } else {
+                    self.update_state = UpdateState::Error;
+                    unsafe {
+                        InvalidateRect(self.flyout_hwnd, null(), 0);
+                    }
+                }
+            }
+            _ => {
+                self.update_state = UpdateState::Checking;
+                let (tx, rx) = mpsc::channel();
+                self.update_rx = Some(rx);
+                let hwnd = self.main_hwnd as isize;
+                thread::spawn(move || {
+                    let res = check_latest_release();
+                    let _ = tx.send(res);
+                    unsafe {
+                        PostMessageW(hwnd as Hwnd, WM_APP_UPDATE_RESULT, 0, 0);
+                    }
+                });
+                unsafe {
+                    InvalidateRect(self.flyout_hwnd, null(), 0);
+                }
+            }
+        }
     }
 
     fn show_toast(&mut self, title: &str, body: &str) {
@@ -503,42 +687,71 @@ unsafe fn get_state_mut<'a>(hwnd: Hwnd) -> Option<&'a mut AppState> {
     }
 }
 
-unsafe fn show_context_menu(hwnd: Hwnd, state: &AppState) {
-    let menu = CreatePopupMenu();
+unsafe fn reposition_flyout(state: &AppState) {
+    let mut work_area = Rect {
+        left: 0,
+        top: 0,
+        right: 1920,
+        bottom: 1040,
+    };
+    SystemParametersInfoW(
+        SPI_GETWORKAREA,
+        0,
+        &mut work_area as *mut Rect as *mut c_void,
+        0,
+    );
 
-    for (idx, m) in state.monitors.iter().enumerate() {
-        let cur = *state.levels.get(&m.id).unwrap_or(&DEFAULT_BRIGHTNESS);
-        let sub = CreatePopupMenu();
-        for (p_idx, pct) in PRESETS.iter().enumerate() {
-            let label = to_wide(&format!("{pct}%"));
-            AppendMenuW(
-                sub,
-                MF_STRING | if cur == *pct { MF_CHECKED } else { 0 },
-                IDM_MONITOR_BASE + idx * 10 + p_idx,
-                label.as_ptr(),
-            );
-        }
-        let m_label = to_wide(&format!("{} — {cur}%", m.label));
-        AppendMenuW(menu, MF_POPUP, sub as usize, m_label.as_ptr());
+    let width = FLYOUT_WIDTH;
+    let height = compute_flyout_height(state.monitors.len(), state.config.sync_all, state.about_open);
+    let x = work_area.right - width - 12;
+    let y = work_area.bottom - height - 12;
+
+    SetWindowPos(state.flyout_hwnd, (-1isize) as Hwnd, x, y, width, height, 0x0010);
+    InvalidateRect(state.flyout_hwnd, null(), 0);
+}
+
+unsafe fn toggle_flyout(state: &mut AppState) {
+    if IsWindowVisible(state.flyout_hwnd) != 0 {
+        state.about_open = false;
+        state.dragging_monitor = None;
+        ShowWindow(state.flyout_hwnd, SW_HIDE);
+        return;
     }
 
-    AppendMenuW(menu, MF_SEPARATOR, 0, null());
-    let night_w = to_wide("Ночной режим (Ctrl+Alt+D)");
-    let reset_w = to_wide("Сбросить всё на 100%");
-    let refresh_w = to_wide("Обновить список мониторов");
-    let exit_w = to_wide("Выход");
+    state.about_open = false;
+    let dark: u32 = 1;
+    let corner: u32 = DWMWCP_ROUND;
+    let border: u32 = 0x00_3A_2A_1E;
+    let backdrop: u32 = DWMSBT_TRANSIENTWINDOW;
+    DwmSetWindowAttribute(
+        state.flyout_hwnd,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &dark as *const u32 as *const c_void,
+        4,
+    );
+    DwmSetWindowAttribute(
+        state.flyout_hwnd,
+        DWMWA_WINDOW_CORNER_PREFERENCE,
+        &corner as *const u32 as *const c_void,
+        4,
+    );
+    DwmSetWindowAttribute(
+        state.flyout_hwnd,
+        DWMWA_BORDER_COLOR,
+        &border as *const u32 as *const c_void,
+        4,
+    );
+    DwmSetWindowAttribute(
+        state.flyout_hwnd,
+        DWMWA_SYSTEMBACKDROP_TYPE,
+        &backdrop as *const u32 as *const c_void,
+        4,
+    );
 
-    AppendMenuW(menu, MF_STRING, IDM_NIGHT_ALL, night_w.as_ptr());
-    AppendMenuW(menu, MF_STRING, IDM_RESET_ALL, reset_w.as_ptr());
-    AppendMenuW(menu, MF_STRING, IDM_REFRESH_MONITORS, refresh_w.as_ptr());
-    AppendMenuW(menu, MF_SEPARATOR, 0, null());
-    AppendMenuW(menu, MF_STRING, IDM_EXIT, exit_w.as_ptr());
-
-    let mut pt = Point { x: 0, y: 0 };
-    GetCursorPos(&mut pt);
-    SetForegroundWindow(hwnd);
-    TrackPopupMenu(menu, TPM_RIGHTALIGN | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, null());
-    DestroyMenu(menu);
+    reposition_flyout(state);
+    ShowWindow(state.flyout_hwnd, SW_SHOW);
+    SetForegroundWindow(state.flyout_hwnd);
+    InvalidateRect(state.flyout_hwnd, null(), 0);
 }
 
 extern "system" fn main_wnd_proc(hwnd: Hwnd, msg: u32, w_param: usize, l_param: isize) -> isize {
@@ -548,11 +761,22 @@ extern "system" fn main_wnd_proc(hwnd: Hwnd, msg: u32, w_param: usize, l_param: 
                 let mouse_msg = (l_param & 0xFFFF) as u32;
                 if mouse_msg == WM_LBUTTONUP || mouse_msg == WM_RBUTTONUP {
                     if let Some(state) = get_state_mut(hwnd) {
-                        show_context_menu(hwnd, state);
+                        toggle_flyout(state);
                     }
                 } else if mouse_msg == WM_LBUTTONDBLCLK {
                     if let Some(state) = get_state_mut(hwnd) {
                         state.toggle_night_all();
+                    }
+                }
+                0
+            }
+            WM_APP_UPDATE_RESULT => {
+                if let Some(state) = get_state_mut(hwnd) {
+                    if let Some(rx) = state.update_rx.take() {
+                        if let Ok(res) = rx.try_recv() {
+                            state.update_state = res;
+                            InvalidateRect(state.flyout_hwnd, null(), 0);
+                        }
                     }
                 }
                 0
@@ -563,30 +787,8 @@ extern "system" fn main_wnd_proc(hwnd: Hwnd, msg: u32, w_param: usize, l_param: 
                         HOTKEY_BRIGHT_UP => state.step_active_monitor(BRIGHTNESS_STEP),
                         HOTKEY_BRIGHT_DOWN => state.step_active_monitor(-BRIGHTNESS_STEP),
                         HOTKEY_NIGHT_TOGGLE => state.toggle_night_all(),
-                        _ => {}
-                    }
-                }
-                0
-            }
-            WM_COMMAND => {
-                if let Some(state) = get_state_mut(hwnd) {
-                    let cmd = w_param & 0xFFFF;
-                    match cmd {
-                        IDM_NIGHT_ALL => state.toggle_night_all(),
-                        IDM_RESET_ALL => state.set_all_levels(MAX_BRIGHTNESS, "Яркость сброшена"),
-                        IDM_REFRESH_MONITORS => {
-                            state.refresh_monitors();
-                            state.show_toast("Мониторы обновлены", &format!("Найдено экранов: {}", state.monitors.len()));
-                        }
-                        IDM_EXIT => PostQuitMessage(0),
-                        c if c >= IDM_MONITOR_BASE => {
-                            let rel = c - IDM_MONITOR_BASE;
-                            let m_idx = rel / 10;
-                            let p_idx = rel % 10;
-                            if let Some(&pct) = PRESETS.get(p_idx) {
-                                state.set_monitor_level(m_idx, pct, true);
-                            }
-                        }
+                        HOTKEY_SYNC_DOWN => state.step_sync_or_primary(-BRIGHTNESS_STEP),
+                        HOTKEY_SYNC_UP => state.step_sync_or_primary(BRIGHTNESS_STEP),
                         _ => {}
                     }
                 }
@@ -594,6 +796,167 @@ extern "system" fn main_wnd_proc(hwnd: Hwnd, msg: u32, w_param: usize, l_param: 
             }
             WM_DESTROY => {
                 PostQuitMessage(0);
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, w_param, l_param),
+        }
+    }
+}
+
+unsafe fn apply_slider_drag(state: &mut AppState, card_idx: usize, x: i32, send_ddc: bool, persist: bool) {
+    let level = x_to_brightness(x);
+    if state.config.sync_all {
+        state.set_all_levels_live(level, send_ddc, persist);
+    } else if let Some(m) = state.monitors.get_mut(card_idx) {
+        state.config.levels.insert(m.id.clone(), level);
+        apply_overlay_only(m, level);
+        if send_ddc {
+            state.ddc.send(m, level);
+        }
+        if persist {
+            state.save_cfg();
+        }
+    }
+    InvalidateRect(state.flyout_hwnd, null(), 0);
+}
+
+extern "system" fn flyout_wnd_proc(hwnd: Hwnd, msg: u32, w_param: usize, l_param: isize) -> isize {
+    unsafe {
+        match msg {
+            WM_ERASEBKGND => 1,
+            WM_ACTIVATE => {
+                if (w_param & 0xFFFF) == WA_INACTIVE {
+                    if let Some(state) = get_state_mut(hwnd) {
+                        state.dragging_monitor = None;
+                        state.about_open = false;
+                    }
+                    ShowWindow(hwnd, SW_HIDE);
+                }
+                0
+            }
+            WM_KEYDOWN => {
+                if w_param == VK_ESCAPE {
+                    if let Some(state) = get_state_mut(hwnd) {
+                        if state.about_open {
+                            state.about_open = false;
+                            reposition_flyout(state);
+                            return 0;
+                        }
+                        state.dragging_monitor = None;
+                    }
+                    ShowWindow(hwnd, SW_HIDE);
+                }
+                0
+            }
+            WM_LBUTTONDOWN => {
+                let x = (l_param & 0xFFFF) as i16 as i32;
+                let y = ((l_param >> 16) & 0xFFFF) as i16 as i32;
+                if let Some(state) = get_state_mut(hwnd) {
+                    if !state.about_open {
+                        if let Some(card_idx) =
+                            hit_test_slider(x, y, state.monitors.len(), state.config.sync_all)
+                        {
+                            state.dragging_monitor = Some(card_idx);
+                            SetCapture(hwnd);
+                            apply_slider_drag(state, card_idx, x, false, false);
+                            return 0;
+                        }
+                    }
+
+                    if let Some(ctrl) = hit_test_control(
+                        x,
+                        y,
+                        state.monitors.len(),
+                        state.config.sync_all,
+                        state.about_open,
+                    ) {
+                        match ctrl {
+                            FlyoutControl::LangToggle => state.toggle_lang(),
+                            FlyoutControl::SyncToggle => state.toggle_sync(),
+                            FlyoutControl::AutostartToggle => state.toggle_autostart(),
+                            FlyoutControl::UpdateAction => state.trigger_update_action(),
+                            FlyoutControl::AboutBack => {
+                                state.about_open = false;
+                                reposition_flyout(state);
+                            }
+                            FlyoutControl::AboutDonate => {
+                                open_external_url(DONATE_URL);
+                                ShowWindow(hwnd, SW_HIDE);
+                            }
+                            FlyoutControl::AboutGithub => {
+                                open_external_url(GITHUB_REPO_URL);
+                                ShowWindow(hwnd, SW_HIDE);
+                            }
+                            FlyoutControl::Footer(action) => match action {
+                                FooterAction::NightMode => {
+                                    state.toggle_night_all();
+                                    InvalidateRect(hwnd, null(), 0);
+                                }
+                                FooterAction::ResetAll => {
+                                    let title = toast_reset_title(state.lang);
+                                    state.set_all_levels(MAX_BRIGHTNESS, title);
+                                    InvalidateRect(hwnd, null(), 0);
+                                }
+                                FooterAction::RefreshMonitors => {
+                                    state.refresh_monitors();
+                                    let title = toast_refreshed_title(state.lang);
+                                    let body = toast_refreshed_body(state.lang, state.monitors.len());
+                                    state.show_toast(title, &body);
+                                    reposition_flyout(state);
+                                }
+                                FooterAction::About => {
+                                    state.about_open = true;
+                                    reposition_flyout(state);
+                                }
+                                FooterAction::Exit => {
+                                    ShowWindow(hwnd, SW_HIDE);
+                                    PostQuitMessage(0);
+                                }
+                            },
+                        }
+                    }
+                }
+                0
+            }
+            WM_MOUSEMOVE => {
+                if let Some(state) = get_state_mut(hwnd) {
+                    if let Some(card_idx) = state.dragging_monitor {
+                        let x = (l_param & 0xFFFF) as i16 as i32;
+                        apply_slider_drag(state, card_idx, x, false, false);
+                    }
+                }
+                0
+            }
+            WM_LBUTTONUP => {
+                if let Some(state) = get_state_mut(hwnd) {
+                    if let Some(card_idx) = state.dragging_monitor.take() {
+                        ReleaseCapture();
+                        let x = (l_param & 0xFFFF) as i16 as i32;
+                        apply_slider_drag(state, card_idx, x, true, true);
+                    }
+                }
+                0
+            }
+            WM_PAINT => {
+                let mut ps = PaintStruct {
+                    hdc: null_mut(),
+                    f_erase: 0,
+                    rc_paint: Rect {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    },
+                    f_restore: 0,
+                    f_inc_update: 0,
+                    rgb_reserved: [0; 32],
+                };
+                let hdc = BeginPaint(hwnd, &mut ps);
+                if let Some(state) = get_state_mut(hwnd) {
+                    let vm = state.build_flyout_vm();
+                    paint_flyout(hdc, &vm);
+                }
+                EndPaint(hwnd, &ps);
                 0
             }
             _ => DefWindowProcW(hwnd, msg, w_param, l_param),
@@ -721,6 +1084,7 @@ pub fn run_app() {
         let main_class = to_wide("MultiMonitorTrayDimmerMain");
         let overlay_class = to_wide("MultiMonitorTrayDimmerOverlay");
         let toast_class = to_wide("MultiMonitorTrayDimmerToast");
+        let flyout_class = to_wide("MultiMonitorTrayDimmerFlyout");
 
         RegisterClassW(&WndClassW {
             style: 0,
@@ -761,6 +1125,19 @@ pub fn run_app() {
             lpsz_class_name: toast_class.as_ptr(),
         });
 
+        RegisterClassW(&WndClassW {
+            style: 0,
+            lpfn_wnd_proc: flyout_wnd_proc,
+            cb_cls_extra: 0,
+            cb_wnd_extra: 0,
+            h_instance: h_inst,
+            h_icon: null_mut(),
+            h_cursor: null_mut(),
+            hbr_background: null_mut(),
+            lpsz_menu_name: null(),
+            lpsz_class_name: flyout_class.as_ptr(),
+        });
+
         let main_hwnd = CreateWindowExW(
             0,
             main_class.as_ptr(),
@@ -791,12 +1168,38 @@ pub fn run_app() {
             null_mut(),
         );
 
+        let flyout_hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            flyout_class.as_ptr(),
+            flyout_class.as_ptr(),
+            WS_POPUP,
+            0,
+            0,
+            FLYOUT_WIDTH,
+            320,
+            null_mut(),
+            null_mut(),
+            h_inst,
+            null_mut(),
+        );
+
         let saved = config_file_path().map(|p| load_config(&p)).unwrap_or_default();
+        let lang = saved.lang.unwrap_or_else(detect_system_lang);
+        let autostart = is_autostart_enabled();
         let mut state = Box::new(AppState {
             h_inst,
+            main_hwnd,
+            flyout_hwnd,
             overlay_class,
             monitors: Vec::new(),
-            levels: saved,
+            config: saved,
+            lang,
+            autostart,
+            about_open: false,
+            ddc: DdcWorker::spawn(),
+            dragging_monitor: None,
+            update_state: UpdateState::Idle,
+            update_rx: None,
             toast_hwnd,
             toast_title: String::new(),
             toast_body: String::new(),
@@ -806,14 +1209,17 @@ pub fn run_app() {
         let state_ptr = Box::into_raw(state);
         SetWindowLongPtrW(main_hwnd, -21, state_ptr as isize);
         SetWindowLongPtrW(toast_hwnd, -21, state_ptr as isize);
+        SetWindowLongPtrW(flyout_hwnd, -21, state_ptr as isize);
 
         RegisterHotKey(main_hwnd, HOTKEY_BRIGHT_UP as i32, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_UP);
         RegisterHotKey(main_hwnd, HOTKEY_BRIGHT_DOWN as i32, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_DOWN);
         RegisterHotKey(main_hwnd, HOTKEY_NIGHT_TOGGLE as i32, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_D);
+        RegisterHotKey(main_hwnd, HOTKEY_SYNC_DOWN as i32, MOD_CONTROL | MOD_WIN | MOD_NOREPEAT, VK_LEFT);
+        RegisterHotKey(main_hwnd, HOTKEY_SYNC_UP as i32, MOD_CONTROL | MOD_WIN | MOD_NOREPEAT, VK_RIGHT);
 
         let icon = create_tray_icon();
         let mut tip = [0u16; 128];
-        let tip_w = to_wide("Multi-Monitor Tray Dimmer — яркость экранов");
+        let tip_w = to_wide(tray_tooltip(lang));
         let n = tip_w.len().min(tip.len() - 1);
         tip[..n].copy_from_slice(&tip_w[..n]);
 
@@ -850,6 +1256,8 @@ pub fn run_app() {
         UnregisterHotKey(main_hwnd, HOTKEY_BRIGHT_UP as i32);
         UnregisterHotKey(main_hwnd, HOTKEY_BRIGHT_DOWN as i32);
         UnregisterHotKey(main_hwnd, HOTKEY_NIGHT_TOGGLE as i32);
+        UnregisterHotKey(main_hwnd, HOTKEY_SYNC_DOWN as i32);
+        UnregisterHotKey(main_hwnd, HOTKEY_SYNC_UP as i32);
         Shell_NotifyIconW(NIM_DELETE, &nid);
         DestroyIcon(icon);
 
