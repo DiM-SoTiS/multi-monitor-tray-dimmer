@@ -221,9 +221,9 @@ pub fn all_monitors_card_label(lang: Lang, count: usize) -> String {
 
 pub fn toast_sync(lang: Lang, enabled: bool) -> (&'static str, &'static str) {
     match (lang, enabled) {
-        (Lang::Ru, true) => ("Синхронизация", "Включена: общий ползунок и Ctrl+Win+←/→"),
+        (Lang::Ru, true) => ("Синхронизация", "Включена: общий ползунок и Ctrl+Alt+←/→"),
         (Lang::Ru, false) => ("Синхронизация", "Отключена: каждый монитор отдельно"),
-        (Lang::En, true) => ("Sync", "Enabled: unified slider & Ctrl+Win+←/→"),
+        (Lang::En, true) => ("Sync", "Enabled: unified slider & Ctrl+Alt+←/→"),
         (Lang::En, false) => ("Sync", "Disabled: per-monitor control"),
     }
 }
@@ -266,7 +266,7 @@ pub fn about_features(lang: Lang) -> &'static str {
             "Нативная утилита трея для плавной регулировки\n",
             "яркости экранов (DDC/CI + мягкий оверлей).\n\n",
             "• Раздельная или синхронная настройка мониторов\n",
-            "• Ctrl+Win+← / → — яркость (все / основной)\n",
+            "• Ctrl+Alt+← / → — яркость (все / основной)\n",
             "• Ctrl+Alt+↑ / ↓ — активный экран, D — Ночь\n",
             "• Автозапуск с Windows и обновления GitHub"
         ),
@@ -274,7 +274,7 @@ pub fn about_features(lang: Lang) -> &'static str {
             "Lightweight native tray utility for smooth\n",
             "multi-monitor dimming (DDC/CI + soft overlay).\n\n",
             "• Per-display or synced brightness control\n",
-            "• Ctrl+Win+← / → — brightness (all / primary)\n",
+            "• Ctrl+Alt+← / → — brightness (all / primary)\n",
             "• Ctrl+Alt+↑ / ↓ — active screen, D — Night\n",
             "• Windows autostart & GitHub auto-updates"
         ),

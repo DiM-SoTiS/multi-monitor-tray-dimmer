@@ -56,7 +56,6 @@ const HOTKEY_SYNC_DOWN: usize = 4;
 const HOTKEY_SYNC_UP: usize = 5;
 const MOD_ALT: u32 = 0x0001;
 const MOD_CONTROL: u32 = 0x0002;
-const MOD_WIN: u32 = 0x0008;
 const MOD_NOREPEAT: u32 = 0x4000;
 const VK_LEFT: u32 = 0x25;
 const VK_UP: u32 = 0x26;
@@ -483,6 +482,9 @@ impl AppState {
             let cur = *self.config.levels.get(&m.id).unwrap_or(&DEFAULT_BRIGHTNESS);
             let next = step_brightness(cur, delta);
             self.set_monitor_level(idx, next, true, true);
+            unsafe {
+                InvalidateRect(self.flyout_hwnd, null(), 0);
+            }
         }
     }
 
@@ -1214,8 +1216,8 @@ pub fn run_app() {
         RegisterHotKey(main_hwnd, HOTKEY_BRIGHT_UP as i32, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_UP);
         RegisterHotKey(main_hwnd, HOTKEY_BRIGHT_DOWN as i32, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_DOWN);
         RegisterHotKey(main_hwnd, HOTKEY_NIGHT_TOGGLE as i32, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_D);
-        RegisterHotKey(main_hwnd, HOTKEY_SYNC_DOWN as i32, MOD_CONTROL | MOD_WIN | MOD_NOREPEAT, VK_LEFT);
-        RegisterHotKey(main_hwnd, HOTKEY_SYNC_UP as i32, MOD_CONTROL | MOD_WIN | MOD_NOREPEAT, VK_RIGHT);
+        RegisterHotKey(main_hwnd, HOTKEY_SYNC_DOWN as i32, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_LEFT);
+        RegisterHotKey(main_hwnd, HOTKEY_SYNC_UP as i32, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_RIGHT);
 
         let icon = create_tray_icon();
         let mut tip = [0u16; 128];
