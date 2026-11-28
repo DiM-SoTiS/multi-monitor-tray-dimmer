@@ -33,6 +33,7 @@ const GITHUB_REPO_URL: &str = "https://github.com/DiM-SoTiS/multi-monitor-tray-d
 
 const WM_APP_TRAY: u32 = 0x8000 + 1;
 const WM_APP_UPDATE_RESULT: u32 = 0x8000 + 2;
+const WM_APP_SHOW_FLYOUT: u32 = 0x8000 + 3;
 const WM_DESTROY: u32 = 0x0002;
 const WM_ACTIVATE: u32 = 0x0006;
 const WM_PAINT: u32 = 0x000F;
@@ -236,6 +237,7 @@ extern "system" {
     fn SetProcessDpiAwarenessContext(value: isize) -> i32;
     fn SetProcessDPIAware() -> i32;
     fn RegisterWindowMessageW(lp_string: *const u16) -> u32;
+    fn FindWindowW(lp_class_name: *const u16, lp_window_name: *const u16) -> Hwnd;
 }
 
 unsafe fn enable_per_monitor_dpi_awareness() {
@@ -771,14 +773,7 @@ unsafe fn reposition_flyout(state: &AppState) {
     InvalidateRect(state.flyout_hwnd, null(), 0);
 }
 
-unsafe fn toggle_flyout(state: &mut AppState) {
-    if IsWindowVisible(state.flyout_hwnd) != 0 {
-        state.about_open = false;
-        state.dragging_monitor = None;
-        ShowWindow(state.flyout_hwnd, SW_HIDE);
-        return;
-    }
-
+unsafe fn show_flyout(state: &mut AppState) {
     state.about_open = false;
     let dark: u32 = 1;
     let corner: u32 = DWMWCP_ROUND;
@@ -815,6 +810,17 @@ unsafe fn toggle_flyout(state: &mut AppState) {
     InvalidateRect(state.flyout_hwnd, null(), 0);
 }
 
+unsafe fn toggle_flyout(state: &mut AppState) {
+    if IsWindowVisible(state.flyout_hwnd) != 0 {
+        state.about_open = false;
+        state.dragging_monitor = None;
+        ShowWindow(state.flyout_hwnd, SW_HIDE);
+        return;
+    }
+
+    show_flyout(state);
+}
+
 extern "system" fn main_wnd_proc(hwnd: Hwnd, msg: u32, w_param: usize, l_param: isize) -> isize {
     unsafe {
         match msg {
@@ -839,6 +845,14 @@ extern "system" fn main_wnd_proc(hwnd: Hwnd, msg: u32, w_param: usize, l_param: 
                             InvalidateRect(state.flyout_hwnd, null(), 0);
                         }
                     }
+                }
+                0
+            }
+            WM_APP_SHOW_FLYOUT => {
+                if let Some(state) = get_state_mut(hwnd) {
+                    let nid = build_notify_icon_data(hwnd, state.tray_icon, state.lang);
+                    Shell_NotifyIconW(NIM_ADD, &nid);
+                    show_flyout(state);
                 }
                 0
             }
@@ -1150,16 +1164,20 @@ extern "system" fn toast_wnd_proc(hwnd: Hwnd, msg: u32, w_param: usize, l_param:
 
 pub fn run_app() {
     unsafe {
+        let main_class = to_wide("MultiMonitorTrayDimmerMain");
         let mutex_name = to_wide("Local\\MultiMonitorTrayDimmerSingleInstance");
         let mutex_handle = CreateMutexW(null_mut(), 0, mutex_name.as_ptr());
         if !mutex_handle.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
+            let existing = FindWindowW(main_class.as_ptr(), null());
+            if !existing.is_null() {
+                PostMessageW(existing, WM_APP_SHOW_FLYOUT, 0, 0);
+            }
             CloseHandle(mutex_handle);
             return;
         }
 
         enable_per_monitor_dpi_awareness();
         let h_inst = GetModuleHandleW(null());
-        let main_class = to_wide("MultiMonitorTrayDimmerMain");
         let overlay_class = to_wide("MultiMonitorTrayDimmerOverlay");
         let toast_class = to_wide("MultiMonitorTrayDimmerToast");
         let flyout_class = to_wide("MultiMonitorTrayDimmerFlyout");
