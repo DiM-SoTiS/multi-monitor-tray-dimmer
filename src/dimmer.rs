@@ -47,6 +47,15 @@ pub fn toggle_night_mode(current: u8) -> u8 {
     }
 }
 
+/// Cycles the active monitor index by `delta` (`-1` or `+1`) with wrap-around.
+pub fn cycle_monitor_index(current: usize, count: usize, delta: isize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let cur = (current % count) as isize;
+    (cur + delta).rem_euclid(count as isize) as usize
+}
+
 pub fn config_file_path() -> Option<PathBuf> {
     env::var("APPDATA")
         .ok()
@@ -125,6 +134,16 @@ mod tests {
         assert_eq!(toggle_night_mode(100), 40);
         assert_eq!(toggle_night_mode(40), 100);
         assert_eq!(toggle_night_mode(30), 100);
+    }
+
+    #[test]
+    fn cycles_monitor_index_with_wraparound() {
+        assert_eq!(cycle_monitor_index(0, 0, 1), 0);
+        assert_eq!(cycle_monitor_index(0, 1, 1), 0);
+        assert_eq!(cycle_monitor_index(0, 3, 1), 1);
+        assert_eq!(cycle_monitor_index(2, 3, 1), 0);
+        assert_eq!(cycle_monitor_index(0, 3, -1), 2);
+        assert_eq!(cycle_monitor_index(1, 3, -1), 0);
     }
 
     #[test]

@@ -12,7 +12,7 @@ pub const CARD_GAP: i32 = 8;
 pub const PAD_X: i32 = 14;
 pub const SETTINGS_HEIGHT: i32 = 36;
 pub const FOOTER_HEIGHT: i32 = 86;
-pub const ABOUT_HEIGHT: i32 = 342;
+pub const ABOUT_HEIGHT: i32 = 358;
 pub const SLIDER_LEFT: i32 = PAD_X + 12;
 pub const SLIDER_RIGHT: i32 = FLYOUT_WIDTH - PAD_X - 12;
 

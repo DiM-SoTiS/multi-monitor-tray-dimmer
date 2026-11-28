@@ -19,7 +19,6 @@ pub type Hmonitor = *mut c_void;
 pub type Handle = *mut c_void;
 
 const MONITORINFOF_PRIMARY: u32 = 0x00000001;
-const MONITOR_DEFAULTTONEAREST: u32 = 0x00000002;
 
 const WS_POPUP: u32 = 0x80000000;
 const WS_EX_TOPMOST: u32 = 0x00000008;
@@ -86,8 +85,6 @@ extern "system" {
         dw_data: isize,
     ) -> i32;
     fn GetMonitorInfoW(h_monitor: Hmonitor, lpmi: *mut MonitorInfoExW) -> i32;
-    fn GetForegroundWindow() -> Hwnd;
-    fn MonitorFromWindow(hwnd: Hwnd, dw_flags: u32) -> Hmonitor;
     fn CreateWindowExW(
         dw_ex_style: u32,
         lp_class_name: *const u16,
@@ -203,13 +200,6 @@ pub fn enumerate_monitors() -> Vec<MonitorEntry> {
     }
     list.sort_by_key(|m| (m.system_number, m.id.clone()));
     list
-}
-
-pub fn active_monitor_handle() -> Hmonitor {
-    unsafe {
-        let fg = GetForegroundWindow();
-        MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST)
-    }
 }
 
 pub fn create_overlay_window(h_inst: *mut c_void, class_name: &[u16], rect: Rect) -> Hwnd {

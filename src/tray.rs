@@ -9,8 +9,8 @@ use std::thread;
 
 use crate::autostart::{is_autostart_enabled, set_autostart_enabled};
 use crate::dimmer::{
-    config_file_path, load_config, save_config, step_brightness, toggle_night_mode, AppConfig,
-    BRIGHTNESS_STEP, DEFAULT_BRIGHTNESS, MAX_BRIGHTNESS,
+    config_file_path, cycle_monitor_index, load_config, save_config, step_brightness,
+    toggle_night_mode, AppConfig, BRIGHTNESS_STEP, DEFAULT_BRIGHTNESS, MAX_BRIGHTNESS,
 };
 use crate::flyout::{
     compute_flyout_height, hit_test_control, hit_test_slider, x_to_brightness, FlyoutControl,
@@ -18,14 +18,14 @@ use crate::flyout::{
 };
 use crate::flyout_ui::{open_external_url, paint_flyout, FlyoutViewModel, SliderCardItem};
 use crate::i18n::{
-    all_monitors_card_label, detect_system_lang, toast_all_monitors, toast_autostart,
-    toast_brightness_set, toast_day_on, toast_night_on, toast_refreshed_body,
+    all_monitors_card_label, detect_system_lang, toast_active_monitor, toast_all_monitors,
+    toast_autostart, toast_brightness_set, toast_day_on, toast_night_on, toast_refreshed_body,
     toast_refreshed_title, toast_reset_title, toast_sync, tray_tooltip, Lang,
 };
 use crate::updater::{check_latest_release, download_and_spawn_replace, UpdateState};
 use crate::win32_monitors::{
-    active_monitor_handle, apply_overlay_only, create_overlay_window, destroy_overlay_windows,
-    enumerate_monitors, DdcWorker, Hwnd, MonitorEntry, Rect,
+    apply_overlay_only, create_overlay_window, destroy_overlay_windows, enumerate_monitors,
+    DdcWorker, Hwnd, MonitorEntry, Rect,
 };
 
 const DONATE_URL: &str = "https://yoomoney.ru/fundraise/1LP6PQKIMJN.261125";
@@ -167,9 +167,18 @@ struct IconInfo {
     hbm_color: Hbitmap,
 }
 
+const ERROR_ALREADY_EXISTS: u32 = 183;
+
 #[link(name = "kernel32")]
 extern "system" {
     fn GetModuleHandleW(lp_module_name: *const u16) -> Hinstance;
+    fn CreateMutexW(
+        lp_mutex_attributes: *mut c_void,
+        b_initial_owner: i32,
+        lp_name: *const u16,
+    ) -> *mut c_void;
+    fn GetLastError() -> u32;
+    fn CloseHandle(h_object: *mut c_void) -> i32;
 }
 
 #[link(name = "user32")]
@@ -226,6 +235,7 @@ extern "system" {
     ) -> i32;
     fn SetProcessDpiAwarenessContext(value: isize) -> i32;
     fn SetProcessDPIAware() -> i32;
+    fn RegisterWindowMessageW(lp_string: *const u16) -> u32;
 }
 
 unsafe fn enable_per_monitor_dpi_awareness() {
@@ -394,6 +404,9 @@ struct AppState {
     flyout_hwnd: Hwnd,
     overlay_class: Vec<u16>,
     monitors: Vec<MonitorEntry>,
+    selected_monitor: usize,
+    taskbar_created_msg: u32,
+    tray_icon: Hicon,
     config: AppConfig,
     lang: Lang,
     autostart: bool,
@@ -405,6 +418,29 @@ struct AppState {
     toast_hwnd: Hwnd,
     toast_title: String,
     toast_body: String,
+}
+
+unsafe fn build_notify_icon_data(hwnd: Hwnd, icon: Hicon, lang: Lang) -> NotifyIconDataW {
+    let mut tip = [0u16; 128];
+    let tip_w = to_wide(tray_tooltip(lang));
+    let n = tip_w.len().min(tip.len() - 1);
+    tip[..n].copy_from_slice(&tip_w[..n]);
+
+    NotifyIconDataW {
+        cb_size: std::mem::size_of::<NotifyIconDataW>() as u32,
+        h_wnd: hwnd,
+        u_id: 1,
+        u_flags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+        u_callback_message: WM_APP_TRAY,
+        h_icon: icon,
+        sz_tip: tip,
+        dw_state: 0,
+        dw_state_mask: 0,
+        sz_info: [0; 256],
+        u_timeout_or_version: 0,
+        sz_info_title: [0; 64],
+        dw_info_flags: 0,
+    }
 }
 
 impl AppState {
@@ -424,6 +460,13 @@ impl AppState {
             self.config.levels.entry(m.id.clone()).or_insert(level);
             apply_overlay_only(m, level);
             ddc.send(m, level);
+        }
+        if self.selected_monitor >= self.monitors.len() {
+            self.selected_monitor = self
+                .monitors
+                .iter()
+                .position(|m| m.is_primary)
+                .unwrap_or(0);
         }
     }
 
@@ -467,44 +510,57 @@ impl AppState {
         }
     }
 
-    fn step_active_monitor(&mut self, delta: i16) {
-        if self.config.sync_all {
-            self.step_sync_or_primary(delta);
+    fn switch_active_monitor(&mut self, delta: isize) {
+        if self.monitors.is_empty() {
             return;
         }
-        let active_h = active_monitor_handle();
-        let idx = self
-            .monitors
-            .iter()
-            .position(|m| m.h_monitor == active_h)
-            .unwrap_or(0);
-        if let Some(m) = self.monitors.get(idx) {
-            let cur = *self.config.levels.get(&m.id).unwrap_or(&DEFAULT_BRIGHTNESS);
-            let next = step_brightness(cur, delta);
-            self.set_monitor_level(idx, next, true, true);
-            unsafe {
+        if self.config.sync_all {
+            self.config.sync_all = false;
+            self.save_cfg();
+        }
+        self.selected_monitor = cycle_monitor_index(self.selected_monitor, self.monitors.len(), delta);
+        if let Some(m) = self.monitors.get(self.selected_monitor) {
+            let level = *self.config.levels.get(&m.id).unwrap_or(&DEFAULT_BRIGHTNESS);
+            let label = m.display_label(self.lang);
+            let (title, body) = toast_active_monitor(self.lang, &label, level);
+            self.show_toast(title, &body);
+        }
+        unsafe {
+            if IsWindowVisible(self.flyout_hwnd) != 0 {
+                reposition_flyout(self);
+            } else {
                 InvalidateRect(self.flyout_hwnd, null(), 0);
             }
         }
     }
 
-    fn step_sync_or_primary(&mut self, delta: i16) {
-        let primary_idx = self
-            .monitors
-            .iter()
-            .position(|m| m.is_primary)
-            .unwrap_or(0);
-        let cur = self
-            .monitors
-            .get(primary_idx)
-            .and_then(|m| self.config.levels.get(&m.id).copied())
-            .unwrap_or(DEFAULT_BRIGHTNESS);
-        let next = step_brightness(cur, delta);
+    fn step_selected_or_all(&mut self, delta: i16) {
+        if self.monitors.is_empty() {
+            return;
+        }
         if self.config.sync_all {
+            let primary_idx = self
+                .monitors
+                .iter()
+                .position(|m| m.is_primary)
+                .unwrap_or(0);
+            let cur = self
+                .monitors
+                .get(primary_idx)
+                .and_then(|m| self.config.levels.get(&m.id).copied())
+                .unwrap_or(DEFAULT_BRIGHTNESS);
+            let next = step_brightness(cur, delta);
             let title = all_monitors_card_label(self.lang, self.monitors.len());
             self.set_all_levels(next, &title);
         } else {
-            self.set_monitor_level(primary_idx, next, true, true);
+            let idx = self.selected_monitor.min(self.monitors.len() - 1);
+            let cur = self
+                .monitors
+                .get(idx)
+                .and_then(|m| self.config.levels.get(&m.id).copied())
+                .unwrap_or(DEFAULT_BRIGHTNESS);
+            let next = step_brightness(cur, delta);
+            self.set_monitor_level(idx, next, true, true);
         }
         unsafe {
             InvalidateRect(self.flyout_hwnd, null(), 0);
@@ -545,14 +601,17 @@ impl AppState {
                 label: all_monitors_card_label(self.lang, self.monitors.len()),
                 brightness: level,
                 accent_amber: true,
+                is_active: true,
             }]
         } else {
             self.monitors
                 .iter()
-                .map(|m| SliderCardItem {
+                .enumerate()
+                .map(|(idx, m)| SliderCardItem {
                     label: m.display_label(self.lang),
                     brightness: *self.config.levels.get(&m.id).unwrap_or(&DEFAULT_BRIGHTNESS),
                     accent_amber: m.is_primary,
+                    is_active: idx == self.selected_monitor,
                 })
                 .collect()
         };
@@ -786,11 +845,11 @@ extern "system" fn main_wnd_proc(hwnd: Hwnd, msg: u32, w_param: usize, l_param: 
             WM_HOTKEY => {
                 if let Some(state) = get_state_mut(hwnd) {
                     match w_param {
-                        HOTKEY_BRIGHT_UP => state.step_active_monitor(BRIGHTNESS_STEP),
-                        HOTKEY_BRIGHT_DOWN => state.step_active_monitor(-BRIGHTNESS_STEP),
+                        HOTKEY_BRIGHT_UP => state.switch_active_monitor(-1),
+                        HOTKEY_BRIGHT_DOWN => state.switch_active_monitor(1),
                         HOTKEY_NIGHT_TOGGLE => state.toggle_night_all(),
-                        HOTKEY_SYNC_DOWN => state.step_sync_or_primary(-BRIGHTNESS_STEP),
-                        HOTKEY_SYNC_UP => state.step_sync_or_primary(BRIGHTNESS_STEP),
+                        HOTKEY_SYNC_DOWN => state.step_selected_or_all(-BRIGHTNESS_STEP),
+                        HOTKEY_SYNC_UP => state.step_selected_or_all(BRIGHTNESS_STEP),
                         _ => {}
                     }
                 }
@@ -800,7 +859,16 @@ extern "system" fn main_wnd_proc(hwnd: Hwnd, msg: u32, w_param: usize, l_param: 
                 PostQuitMessage(0);
                 0
             }
-            _ => DefWindowProcW(hwnd, msg, w_param, l_param),
+            _ => {
+                if let Some(state) = get_state_mut(hwnd) {
+                    if state.taskbar_created_msg != 0 && msg == state.taskbar_created_msg {
+                        let nid = build_notify_icon_data(hwnd, state.tray_icon, state.lang);
+                        Shell_NotifyIconW(NIM_ADD, &nid);
+                        return 0;
+                    }
+                }
+                DefWindowProcW(hwnd, msg, w_param, l_param)
+            }
         }
     }
 }
@@ -810,6 +878,7 @@ unsafe fn apply_slider_drag(state: &mut AppState, card_idx: usize, x: i32, send_
     if state.config.sync_all {
         state.set_all_levels_live(level, send_ddc, persist);
     } else if let Some(m) = state.monitors.get_mut(card_idx) {
+        state.selected_monitor = card_idx;
         state.config.levels.insert(m.id.clone(), level);
         apply_overlay_only(m, level);
         if send_ddc {
@@ -1081,6 +1150,13 @@ extern "system" fn toast_wnd_proc(hwnd: Hwnd, msg: u32, w_param: usize, l_param:
 
 pub fn run_app() {
     unsafe {
+        let mutex_name = to_wide("Local\\MultiMonitorTrayDimmerSingleInstance");
+        let mutex_handle = CreateMutexW(null_mut(), 0, mutex_name.as_ptr());
+        if !mutex_handle.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
+            CloseHandle(mutex_handle);
+            return;
+        }
+
         enable_per_monitor_dpi_awareness();
         let h_inst = GetModuleHandleW(null());
         let main_class = to_wide("MultiMonitorTrayDimmerMain");
@@ -1188,12 +1264,17 @@ pub fn run_app() {
         let saved = config_file_path().map(|p| load_config(&p)).unwrap_or_default();
         let lang = saved.lang.unwrap_or_else(detect_system_lang);
         let autostart = is_autostart_enabled();
+        let taskbar_created_msg = RegisterWindowMessageW(to_wide("TaskbarCreated").as_ptr());
+        let icon = create_tray_icon();
         let mut state = Box::new(AppState {
             h_inst,
             main_hwnd,
             flyout_hwnd,
             overlay_class,
             monitors: Vec::new(),
+            selected_monitor: usize::MAX,
+            taskbar_created_msg,
+            tray_icon: icon,
             config: saved,
             lang,
             autostart,
@@ -1219,27 +1300,7 @@ pub fn run_app() {
         RegisterHotKey(main_hwnd, HOTKEY_SYNC_DOWN as i32, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_LEFT);
         RegisterHotKey(main_hwnd, HOTKEY_SYNC_UP as i32, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_RIGHT);
 
-        let icon = create_tray_icon();
-        let mut tip = [0u16; 128];
-        let tip_w = to_wide(tray_tooltip(lang));
-        let n = tip_w.len().min(tip.len() - 1);
-        tip[..n].copy_from_slice(&tip_w[..n]);
-
-        let nid = NotifyIconDataW {
-            cb_size: std::mem::size_of::<NotifyIconDataW>() as u32,
-            h_wnd: main_hwnd,
-            u_id: 1,
-            u_flags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
-            u_callback_message: WM_APP_TRAY,
-            h_icon: icon,
-            sz_tip: tip,
-            dw_state: 0,
-            dw_state_mask: 0,
-            sz_info: [0; 256],
-            u_timeout_or_version: 0,
-            sz_info_title: [0; 64],
-            dw_info_flags: 0,
-        };
+        let nid = build_notify_icon_data(main_hwnd, icon, lang);
         Shell_NotifyIconW(NIM_ADD, &nid);
 
         let mut msg = Msg {
@@ -1265,5 +1326,8 @@ pub fn run_app() {
 
         let mut boxed_state = Box::from_raw(state_ptr);
         destroy_overlay_windows(&mut boxed_state.monitors);
+        if !mutex_handle.is_null() {
+            CloseHandle(mutex_handle);
+        }
     }
 }

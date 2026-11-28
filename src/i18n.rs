@@ -260,23 +260,30 @@ pub fn about_heading(lang: Lang) -> &'static str {
     }
 }
 
+pub fn toast_active_monitor(lang: Lang, monitor_label: &str, level: u8) -> (&'static str, String) {
+    match lang {
+        Lang::Ru => ("Активный монитор", format!("{monitor_label} — {level}%")),
+        Lang::En => ("Active monitor", format!("{monitor_label} — {level}%")),
+    }
+}
+
 pub fn about_features(lang: Lang) -> &'static str {
     match lang {
         Lang::Ru => concat!(
             "Нативная утилита трея для плавной регулировки\n",
             "яркости экранов (DDC/CI + мягкий оверлей).\n\n",
-            "• Раздельная или синхронная настройка мониторов\n",
-            "• Ctrl+Alt+← / → — яркость (все / основной)\n",
-            "• Ctrl+Alt+↑ / ↓ — активный экран, D — Ночь\n",
-            "• Автозапуск с Windows и обновления GitHub"
+            "Нажмите Ctrl+Alt и:\n",
+            "• ↑ / ↓ — сменить активный монитор\n",
+            "• ← / → — яркость (активный / все)\n",
+            "• D — Ночной режим (40% ↔ 100%)"
         ),
         Lang::En => concat!(
             "Lightweight native tray utility for smooth\n",
             "multi-monitor dimming (DDC/CI + soft overlay).\n\n",
-            "• Per-display or synced brightness control\n",
-            "• Ctrl+Alt+← / → — brightness (all / primary)\n",
-            "• Ctrl+Alt+↑ / ↓ — active screen, D — Night\n",
-            "• Windows autostart & GitHub auto-updates"
+            "Press Ctrl+Alt and:\n",
+            "• ↑ / ↓ — switch active monitor\n",
+            "• ← / → — brightness (active / all)\n",
+            "• D — Night Mode (40% ↔ 100%)"
         ),
     }
 }

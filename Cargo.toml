@@ -1,6 +1,6 @@
 [package]
 name = "multi-monitor-tray-dimmer"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2021"
 description = "Lightweight Windows tray utility to dim and control brightness per monitor via Cosmic Glass HUD sliders, DDC/CI, and global hotkeys."
 

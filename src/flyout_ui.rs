@@ -128,6 +128,7 @@ pub struct SliderCardItem {
     pub label: String,
     pub brightness: u8,
     pub accent_amber: bool,
+    pub is_active: bool,
 }
 
 pub struct FlyoutViewModel<'a> {
@@ -299,7 +300,8 @@ unsafe fn paint_controls_body(
         let top = start_y + (idx as i32) * (CARD_HEIGHT + CARD_GAP);
         let card_r = (PAD_X, top, FLYOUT_WIDTH - PAD_X, top + CARD_HEIGHT);
         let accent = if card.accent_amber { COL_AMBER } else { COL_CYAN };
-        draw_round_box(hdc, card_r, 12, COL_CARD_BG, COL_CARD_BORDER);
+        let border = if card.is_active { accent } else { COL_CARD_BORDER };
+        draw_round_box(hdc, card_r, 12, COL_CARD_BG, border);
 
         SelectObject(hdc, font_ui);
         draw_text(
@@ -417,7 +419,7 @@ unsafe fn paint_about_body(
     font_small: Hfont,
 ) {
     // Info card
-    let info_r = (PAD_X, HEADER_HEIGHT + 10, FLYOUT_WIDTH - PAD_X, HEADER_HEIGHT + 150);
+    let info_r = (PAD_X, HEADER_HEIGHT + 10, FLYOUT_WIDTH - PAD_X, HEADER_HEIGHT + 166);
     draw_round_box(hdc, info_r, 12, COL_CARD_BG, COL_CARD_BORDER);
 
     SelectObject(hdc, font_bold);
